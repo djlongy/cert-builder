@@ -1,0 +1,43 @@
+# Build artifacts
+build.env
+*.log
+
+# CA certificates pulled at build time — never committed (the public
+# CA PEM lives in Artifactory; CI curls it before build, removes after)
+certs/*.crt
+certs/*.pem
+certs/*.srl
+certs/*.key
+certs/*.csr
+!certs/.gitkeep
+
+# Template clone cache (only present when CI / local dev clones it in)
+template/
+
+# SBOM / scan outputs — produced by the pipeline, not committed
+sbom*.json
+sbom*.xml
+*.cdx.json
+*.spdx.json
+vuln-scan.json
+grype-report.json
+trivy-report.json
+
+# Auto-installed tool binaries
+.bin/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Agent / editor runtime state
+.claude/
+
+# Local workspace for credentials, test runners, private scratchpads
+local/
+
+# Vault / credentials — never committed
+.vault-token
+credentials*.env

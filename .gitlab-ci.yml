@@ -1,0 +1,316 @@
+# cert-builder container build pipeline
+#
+# Mirrors prometheus / redis (template-consumer pattern) with ONE
+# cert-builder-specific addition: a CA-fetch step that curls the
+# corp CA PEM from Artifactory into certs/ before build, then
+# removes it after. The CA never lives in git.
+#
+# Required CI variables on this project (Settings > CI/CD > Variables):
+#   ARTIFACTORY_PASSWORD              masked, push secret for team-docker-dev
+#   CORP_CA_URL                       URL of the corp CA PEM in Artifactory
+#                                     (team-generic-dev/ca/corp-ca.crt)
+#   SPLUNK_HEC_URL, SPLUNK_HEC_TOKEN  ingest stage Splunk sink
+#   ARTIFACTORY_SBOM_ARCHIVE_REPO     ingest stage Artifactory SBOM archive
+#   ARTIFACTORY_VULN_ARCHIVE_REPO     ingest stage Artifactory vuln archive
+#   ALLOW_TRIVY_RUN                   second gate for the trivy kill-switch
+#                                     (value: yes-i-understand-trivy-is-banned)
+
+stages:
+  - prescan
+  - build
+  - postscan
+  - ingest
+
+variables:
+  TEMPLATE_REPO: "https://git.example.com/org/container-image-template.git"
+  TEMPLATE_REF: "main"
+
+  # ── docker:dind ─────────────────────────────────────────────────────
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_BUILDKIT: "1"
+  DOCKER_CLI_IMAGE: "docker:27-cli"
+  DOCKER_DIND_IMAGE: "docker:27-dind"
+  ALPINE_IMAGE: "alpine:3.20"
+
+# ── Cache the template/ clone across every job in the pipeline ─────
+.template-cache: &template-cache
+  cache:
+    key: "template-${TEMPLATE_REF}"
+    paths:
+      - template/
+    policy: pull-push
+
+# ── Setup steps every job needs ────────────────────────────────────
+.template-setup: &template-setup
+  - |
+    if command -v bash >/dev/null 2>&1 \
+       && command -v git >/dev/null 2>&1 \
+       && command -v curl >/dev/null 2>&1 \
+       && command -v openssl >/dev/null 2>&1 \
+       && command -v jq >/dev/null 2>&1 \
+       && command -v python3 >/dev/null 2>&1; then
+      echo "→ tools already on PATH — skipping apk add"
+    else
+      apk add --no-cache bash git curl openssl jq python3
+    fi
+  - |
+    _host="${TEMPLATE_REPO#https://}"; _host="${_host#http://}"
+    _auth_url="https://gitlab-ci-token:${CI_JOB_TOKEN}@${_host}"
+    if [ ! -d template/.git ]; then
+      echo "→ cloning ${TEMPLATE_REPO} @ ${TEMPLATE_REF} → template/"
+      git clone --depth 1 --branch "${TEMPLATE_REF}" "${_auth_url}" template
+    else
+      # Cache hit: always refresh to ${TEMPLATE_REF} HEAD so a template
+      # commit pushed AFTER this pipeline's cache was warmed is picked
+      # up.
+      echo "→ template/ cache hit — fetching ${TEMPLATE_REF} HEAD"
+      ( cd template \
+          && git remote set-url origin "${_auth_url}" \
+          && git fetch --depth 1 origin "${TEMPLATE_REF}" \
+          && git reset --hard FETCH_HEAD \
+          && echo "  ✓ template at $(git rev-parse --short HEAD)" )
+    fi
+    export TEMPLATE_ROOT="$(pwd)/template"
+    export PROJECT_ROOT="$(pwd)"
+  - |
+    # POSIX-sh image.env loader with shell-wins precedence.
+    if [ -f image.env ]; then
+      _IMG_KEYS=$(grep -oE '^[A-Z_][A-Z0-9_]*=' image.env | sed 's/=$//' | sort -u)
+      _IMG_SNAP=$(mktemp)
+      for k in $_IMG_KEYS; do
+        eval "_v=\"\${${k}:-}\""
+        if [ -n "${_v}" ]; then
+          printf '%s\t%s\n' "${k}" "$(printf '%s' "${_v}" | base64 | tr -d '\n')" >> "${_IMG_SNAP}"
+        fi
+      done
+      set -a; . ./image.env; set +a
+      while read -r _line; do
+        _rk="${_line%%	*}"
+        _rv="${_line#*	}"
+        _rdec=$(printf '%s' "${_rv}" | base64 -d)
+        eval "${_rk}=\"\${_rdec}\""
+        export "${_rk}"
+      done < "${_IMG_SNAP}"
+      rm -f "${_IMG_SNAP}"
+      unset _IMG_KEYS _IMG_SNAP _v _line _rk _rv _rdec
+    fi
+  - |
+    # Write ~/.docker/config.json so scan jobs can auth to UPSTREAM_REGISTRY.
+    if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ] && [ -n "${UPSTREAM_REGISTRY:-}" ]; then
+      _host="${UPSTREAM_REGISTRY%%/*}"
+      AUTH=$(printf '%s:%s' "${ARTIFACTORY_USER}" "${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')
+      mkdir -p "${HOME}/.docker"
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${_host}" "${AUTH}" > "${HOME}/.docker/config.json"
+      chmod 600 "${HOME}/.docker/config.json"
+      echo "→ wrote ~/.docker/config.json for ${_host}"
+    fi
+  - |
+    # crane install (for base.digest resolution in build.sh).
+    mkdir -p "${HOME}/.local/bin"
+    export PATH="${HOME}/.local/bin:${PATH}"
+    if ! command -v crane >/dev/null 2>&1 && [ -n "${CRANE_URL:-}" ]; then
+      echo "→ installing crane from CRANE_URL"
+      if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ]; then
+        curl -fsL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
+      else
+        curl -fsL "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
+      fi
+      echo "  ✓ crane $(crane version 2>&1 | head -1)"
+    fi
+
+# ═══════════════════════════════════════════════════════════════════
+# BUILD — pre-step curls the corp CA into certs/ then removes after
+# ═══════════════════════════════════════════════════════════════════
+build:
+  stage: build
+  image: ${DOCKER_CLI_IMAGE}
+  services:
+    - name: ${DOCKER_DIND_IMAGE}
+      alias: docker
+  <<: *template-cache
+  before_script:
+    - *template-setup
+    - |
+      # Pull the corp CA from Artifactory into certs/ for this build.
+      # The cert is never committed to this repo — it lives in a
+      # generic Artifactory repo and gets fetched fresh per pipeline.
+      # Removed via the trap below regardless of build outcome.
+      if [ -z "${CORP_CA_URL:-}" ]; then
+        echo "ERROR: CORP_CA_URL not set (Settings > CI/CD > Variables)" >&2
+        echo "  Expected URL: https://artifactory.example.com/artifactory/team-generic-dev/ca/corp-ca.crt" >&2
+        exit 1
+      fi
+      mkdir -p certs
+      echo "→ fetching corp CA from ${CORP_CA_URL}"
+      if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ]; then
+        curl -fsSL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" \
+          "${CORP_CA_URL}" -o certs/corp-ca.crt
+      else
+        curl -fsSL "${CORP_CA_URL}" -o certs/corp-ca.crt
+      fi
+      echo "  ✓ fetched $(wc -c < certs/corp-ca.crt) bytes"
+      # Always wipe the cert before the job exits, even on build failure.
+      trap 'echo "→ wiping corp CA from disk"; rm -f certs/corp-ca.crt' EXIT
+  script:
+    # Branch-aware push (main + tags only push to registry).
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] || [ -n "$CI_COMMIT_TAG" ]; then
+        bash template/scripts/build.sh --push --project-root "$(pwd)"
+      else
+        bash template/scripts/build.sh --project-root "$(pwd)"
+      fi
+  artifacts:
+    paths:
+      - build.env
+    reports:
+      dotenv: build.env
+    expire_in: 1 week
+
+# ═══════════════════════════════════════════════════════════════════
+# PRESCAN — Syft SBOM of UPSTREAM_REF (alpine baseline)
+# ═══════════════════════════════════════════════════════════════════
+syft-sbom-prescan:
+  stage: prescan
+  image: ${ALPINE_IMAGE}
+  needs: []
+  <<: *template-cache
+  before_script:
+    - *template-setup
+  script:
+    - |
+      export SBOM_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+      bash template/scripts/scan/syft-sbom.sh
+  artifacts:
+    paths:
+      - sbom.cdx.json
+    expire_in: 1 month
+    when: always
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Syft SBOM of the BUILT cert-builder image
+# ═══════════════════════════════════════════════════════════════════
+syft-sbom-postscan:
+  stage: postscan
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+  <<: *template-cache
+  before_script:
+    - *template-setup
+  script:
+    - set -a; . ./build.env; set +a
+    - bash template/scripts/scan/syft-sbom.sh
+  artifacts:
+    paths:
+      - ${SBOM_FILE}
+    reports:
+      cyclonedx: ${SBOM_FILE}
+    expire_in: 1 month
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Grype vulnerability scan (consumes Syft SBOM)
+# ═══════════════════════════════════════════════════════════════════
+grype-vuln:
+  stage: postscan
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+    - job: syft-sbom-postscan
+      artifacts: true
+  <<: *template-cache
+  before_script:
+    - *template-setup
+  script:
+    - set -a; . ./build.env; set +a
+    - bash template/scripts/scan/grype-vuln.sh
+  artifacts:
+    paths:
+      - ${VULN_SCAN_FILE}
+    expire_in: 1 month
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Trivy SBOM + vuln (gated by ALLOW_TRIVY_RUN CI variable)
+# ═══════════════════════════════════════════════════════════════════
+trivy-sbom-postscan:
+  stage: postscan
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+  <<: *template-cache
+  before_script:
+    - *template-setup
+  script:
+    - set -a; . ./build.env; set +a
+    - export SBOM_FILE="sbom-trivy.cdx.json"
+    - export SBOM_INLINE_POST="true"
+    - bash template/scripts/scan/trivy-sbom.sh
+  artifacts:
+    paths:
+      - sbom-trivy.cdx.json
+    expire_in: 1 month
+  allow_failure: true
+
+trivy-vuln-postscan:
+  stage: postscan
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+  <<: *template-cache
+  before_script:
+    - *template-setup
+  script:
+    - set -a; . ./build.env; set +a
+    - export VULN_SCAN_FILE="vuln-scan-trivy.json"
+    - export VULN_INLINE_POST="true"
+    - bash template/scripts/scan/trivy-vuln.sh
+  artifacts:
+    paths:
+      - vuln-scan-trivy.json
+    expire_in: 1 month
+  allow_failure: true
+
+# ═══════════════════════════════════════════════════════════════════
+# INGEST — ship SBOM + vuln to configured sinks
+# ═══════════════════════════════════════════════════════════════════
+sbom-ingest:
+  stage: ingest
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+    - job: syft-sbom-postscan
+      artifacts: true
+  <<: *template-cache
+  before_script:
+    - *template-setup
+  script:
+    - set -a; . ./build.env; set +a
+    - bash template/scripts/ingest/sbom-post.sh "${SBOM_FILE}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: true
+
+vuln-ingest:
+  stage: ingest
+  image: ${ALPINE_IMAGE}
+  needs:
+    - job: build
+      artifacts: true
+    - job: grype-vuln
+      artifacts: true
+  <<: *template-cache
+  before_script:
+    - *template-setup
+  script:
+    - set -a; . ./build.env; set +a
+    - bash template/scripts/ingest/vuln-post.sh "${VULN_SCAN_FILE}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: true

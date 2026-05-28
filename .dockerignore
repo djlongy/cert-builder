@@ -1,0 +1,13 @@
+# Build context excludes — keep the docker build context tiny so
+# COPY directives only see what's intended.
+.git/
+.gitignore
+README.md
+.dockerignore
+template/
+.bin/
+build.env
+*.log
+sbom*.json
+*.cdx.json
+vuln-scan.json
