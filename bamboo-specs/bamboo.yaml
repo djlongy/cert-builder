@@ -1,0 +1,345 @@
+# cert-builder container build plan — Bamboo equivalent of .gitlab-ci.yml
+#
+# Self-contained — every stage / job is defined inline so this file
+# can be read top-to-bottom without chasing includes. Build/scan/ingest
+# LOGIC comes from container-image-template's scripts/ tree, which each
+# job clones into template/ at the start of its script.
+#
+# 1:1 parity with .gitlab-ci.yml — same stages, same jobs, same
+# `bash template/scripts/<...>.sh` entry points. Only difference is
+# that Bamboo gives each job its own fresh workspace (no inter-job
+# cache like GitLab `cache:`), so each job clones the template freshly.
+#
+# Atlassian YAML Specs v2.
+#
+# ── How Bamboo plan/global variables flow into scripts ───────────────
+#
+# Bamboo exposes plan variables + System Global variables as env vars
+# with a `bamboo_` prefix. scripts/lib/load-image-env.sh auto-imports
+# every `bamboo_FOO` env var as a bare `FOO` BEFORE sourcing image.env.
+# That means a plan var named `ARTIFACTORY_TOKEN` becomes a bare
+# `ARTIFACTORY_TOKEN` for build.sh without any shim.
+#
+# Cases where the shared service-account global has a DIFFERENT name
+# than build.sh expects (e.g. `svc_artifactory_password` vs `ARTIFACTORY_PASSWORD`)
+# need an explicit `export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password}"`
+# in the task script. See the Build job for the pattern.
+#
+# ── Required plan variables (set in Bamboo plan config) ──────────────
+#
+#   GIT_TOKEN                 read-token for cloning the template repo
+#                             (Bearer auth, masked global var preferred)
+#   ARTIFACTORY_PASSWORD      push secret matching REGISTRY_KIND=artifactory
+#                             in image.env (masked)
+#
+# Everything else lives in image.env (committed, pipeline-agnostic).
+
+---
+version: 2
+
+plan:
+  project-key: SOFTWARE
+  key: CB
+  name: Cert-Builder Container Image
+  description: |-
+    Cert-builder container image — consumer of container-image-template.
+    Pipeline mirrors .gitlab-ci.yml stage-for-stage.
+
+triggers:
+  - polling: 60
+
+stages:
+  - Prescan:
+      jobs:
+        - Syft SBOM Prescan
+  - Build:
+      jobs:
+        - Build
+  - Postscan:
+      jobs:
+        - Syft SBOM Postscan
+        - Grype Vuln
+  - Ingest:
+      jobs:
+        - SBOM Ingest
+
+# ── Shared script preamble (every job runs this) ─────────────────────
+# Has to be inlined per job (YAML anchors not supported by Bamboo's
+# spec parser the same way GitLab's are). Each job's script block
+# starts with this preamble:
+#
+#   1. Clone container-image-template into template/ using GIT_TOKEN
+#   2. Export TEMPLATE_ROOT (where scripts live) + PROJECT_ROOT (CWD)
+#   3. Install crane locally if missing
+#
+# Then the job-specific command (build.sh / scan/* / ingest/*) runs.
+
+# ═══════════════════════════════════════════════════════════════════
+# BUILD
+# ═══════════════════════════════════════════════════════════════════
+Build:
+  tasks:
+    - checkout
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+
+            # ── Path gate ────────────────────────────────────────────
+            # Skip the full build/scan flow when no image-relevant file
+            # changed. Writes SKIP=true to build.env; every downstream
+            # job checks SKIP and no-ops. bamboo_FORCE_ALL=true bypasses.
+            if [ "${bamboo_FORCE_ALL:-false}" != "true" ]; then
+              CHANGED=$(git diff --name-only HEAD~1 HEAD \
+                -- image.env Dockerfile inject-certs.sh install-ca-certificates.sh certs/ bamboo-specs/bamboo.yaml 2>/dev/null \
+                || git diff --name-only HEAD \
+                -- image.env Dockerfile inject-certs.sh install-ca-certificates.sh certs/ bamboo-specs/bamboo.yaml)
+              if [ -z "$CHANGED" ]; then
+                echo "No image-relevant changes — skipping"
+                echo "SKIP=true" > build.env
+                exit 0
+              fi
+              echo "Changed image-relevant files:"
+              echo "$CHANGED" | sed 's/^/  /'
+            fi
+
+            # ── Clone container-image-template for the build scripts ─
+            TEMPLATE_REPO="https://git.example.com/org/container-image-template.git"
+            TEMPLATE_REF="main"
+            if [ -z "${bamboo_GIT_TOKEN:-}" ]; then
+              echo "ERROR: bamboo_GIT_TOKEN plan var unset — required to clone template" >&2
+              exit 1
+            fi
+            _host="${TEMPLATE_REPO#https://}"; _host="${_host#http://}"
+            git clone --depth 1 --branch "${TEMPLATE_REF}" \
+              -c "http.extraHeader=Authorization: Bearer ${bamboo_GIT_TOKEN}" \
+              "${TEMPLATE_REPO}" template
+            export TEMPLATE_ROOT="$(pwd)/template"
+            export PROJECT_ROOT="$(pwd)"
+
+            # ── Bamboo svc_* shim → script-expected names ────────────
+            # build.sh auto-imports bamboo_* env vars. svc_* prefixed
+            # globals need explicit rename to the bare name.
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
+
+            # crane install fallback (build.sh needs it for base.digest).
+            # Source image.env first to pick up CRANE_URL + ARTIFACTORY_*
+            # creds (needed when CRANE_URL points at an auth-protected
+            # internal mirror). image.env wins over the bamboo_ default.
+            set -a; . ./image.env; set +a
+            if ! command -v crane >/dev/null 2>&1; then
+              CRANE_URL="${CRANE_URL:-${bamboo_CRANE_URL:-https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz}}"
+              mkdir -p "${HOME}/.local/bin"
+              # -fsL: fail fast on HTTP errors (prevents HTML-error-body
+              # → tar: invalid magic). Add auth when ARTIFACTORY_* set.
+              if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ]; then
+                curl -fsL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
+              else
+                curl -fsL "${CRANE_URL}" | tar xz -C "${HOME}/.local/bin/" crane
+              fi
+              export PATH="${HOME}/.local/bin:${PATH}"
+            fi
+
+            # ── Fetch corp CA from Artifactory into certs/ ───────────
+            # cert-builder bakes the corp CA into the image at build
+            # time. The PEM is never committed to git — it lives in
+            # Artifactory's generic repo and gets curl'd in here, then
+            # the trap wipes it on job exit (success or fail).
+            #
+            # Required plan var: CORP_CA_URL (e.g.
+            # https://artifactory.example.com/artifactory/team-generic-dev/ca/corp-ca.crt)
+            if [ -z "${bamboo_CORP_CA_URL:-}" ]; then
+              echo "ERROR: bamboo_CORP_CA_URL plan var unset — needed for cert-builder" >&2
+              exit 1
+            fi
+            mkdir -p certs
+            echo "→ fetching corp CA from ${bamboo_CORP_CA_URL}"
+            if [ -n "${ARTIFACTORY_USER:-}" ] && [ -n "${ARTIFACTORY_PASSWORD:-}" ]; then
+              curl -fsSL -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" \
+                "${bamboo_CORP_CA_URL}" -o certs/corp-ca.crt
+            else
+              curl -fsSL "${bamboo_CORP_CA_URL}" -o certs/corp-ca.crt
+            fi
+            echo "  ✓ fetched $(wc -c < certs/corp-ca.crt) bytes"
+            # Wipe the CA on job exit regardless of build outcome.
+            trap 'echo "→ wiping corp CA from disk"; rm -f certs/corp-ca.crt' EXIT
+
+            # Branch-aware push: main/master pushes to the registry,
+            # everything else validates (build + scan) without pushing
+            # so short-lived feature branches don't pollute the registry.
+            # build.sh handles its own docker login + jf install (via
+            # the artifactory backend); it sources image.env via
+            # load-image-env.sh which honours --project-root.
+            if [ "$bamboo_planRepository_branchName" = "main" ] || [ "$bamboo_planRepository_branchName" = "master" ]; then
+              bash template/scripts/build.sh --push --project-root "$(pwd)"
+            else
+              bash template/scripts/build.sh --project-root "$(pwd)"
+            fi
+  artifacts:
+    - name: build-env
+      location: .
+      pattern: build.env
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# PRESCAN — Syft SBOM of UPSTREAM_REF
+# ═══════════════════════════════════════════════════════════════════
+Syft SBOM Prescan:
+  tasks:
+    - checkout
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+
+            TEMPLATE_REPO="https://git.example.com/org/container-image-template.git"
+            TEMPLATE_REF="main"
+            if [ -z "${bamboo_GIT_TOKEN:-}" ]; then
+              echo "ERROR: bamboo_GIT_TOKEN plan var unset" >&2; exit 1
+            fi
+            _host="${TEMPLATE_REPO#https://}"; _host="${_host#http://}"
+            git clone --depth 1 --branch "${TEMPLATE_REF}" \
+              -c "http.extraHeader=Authorization: Bearer ${bamboo_GIT_TOKEN}" \
+              "${TEMPLATE_REPO}" template
+            export TEMPLATE_ROOT="$(pwd)/template"
+            export PROJECT_ROOT="$(pwd)"
+
+            # Source per-image image.env for UPSTREAM_REGISTRY etc.
+            set -a; . ./image.env; set +a
+            export SBOM_SCAN_REF="${UPSTREAM_REGISTRY}/${UPSTREAM_IMAGE}:${UPSTREAM_TAG}"
+
+            bash template/scripts/scan/syft-sbom.sh
+  artifacts:
+    - name: sbom-prescan
+      location: .
+      pattern: 'sbom.cdx.json'
+      shared: true
+      required: false
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Syft SBOM of the BUILT image
+# ═══════════════════════════════════════════════════════════════════
+Syft SBOM Postscan:
+  tasks:
+    - checkout
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            TEMPLATE_REPO="https://git.example.com/org/container-image-template.git"
+            TEMPLATE_REF="main"
+            if [ -z "${bamboo_GIT_TOKEN:-}" ]; then
+              echo "ERROR: bamboo_GIT_TOKEN plan var unset" >&2; exit 1
+            fi
+            _host="${TEMPLATE_REPO#https://}"; _host="${_host#http://}"
+            git clone --depth 1 --branch "${TEMPLATE_REF}" \
+              -c "http.extraHeader=Authorization: Bearer ${bamboo_GIT_TOKEN}" \
+              "${TEMPLATE_REPO}" template
+            export TEMPLATE_ROOT="$(pwd)/template"
+            export PROJECT_ROOT="$(pwd)"
+
+            # Multi-registry login lib needs auth for the pushed digest pull.
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
+
+            bash template/scripts/scan/syft-sbom.sh
+  artifacts:
+    - name: sbom
+      location: .
+      pattern: 'sbom.cdx.json'
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# POSTSCAN — Grype vulnerability scan (consumes Syft SBOM)
+# ═══════════════════════════════════════════════════════════════════
+Grype Vuln:
+  tasks:
+    - checkout
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+          - name: sbom
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            TEMPLATE_REPO="https://git.example.com/org/container-image-template.git"
+            TEMPLATE_REF="main"
+            if [ -z "${bamboo_GIT_TOKEN:-}" ]; then
+              echo "ERROR: bamboo_GIT_TOKEN plan var unset" >&2; exit 1
+            fi
+            _host="${TEMPLATE_REPO#https://}"; _host="${_host#http://}"
+            git clone --depth 1 --branch "${TEMPLATE_REF}" \
+              -c "http.extraHeader=Authorization: Bearer ${bamboo_GIT_TOKEN}" \
+              "${TEMPLATE_REPO}" template
+            export TEMPLATE_ROOT="$(pwd)/template"
+            export PROJECT_ROOT="$(pwd)"
+
+            bash template/scripts/scan/grype-vuln.sh
+  artifacts:
+    - name: vuln-scan-grype
+      location: .
+      pattern: vuln-scan.json
+      shared: true
+  requirements:
+    - system.docker.executable
+
+# ═══════════════════════════════════════════════════════════════════
+# INGEST — ship SBOM to configured sinks
+# ═══════════════════════════════════════════════════════════════════
+# || true mirrors GitLab's allow_failure: true — sink outages don't
+# block the pipeline. Script no-ops on missing sink config.
+SBOM Ingest:
+  tasks:
+    - checkout
+    - artifact-download:
+        artifacts:
+          - name: build-env
+            destination: .
+          - name: sbom
+            destination: .
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
+            [ "${SKIP:-false}" = "true" ] && { echo "SKIP=true — no-op"; exit 0; }
+
+            TEMPLATE_REPO="https://git.example.com/org/container-image-template.git"
+            TEMPLATE_REF="main"
+            if [ -z "${bamboo_GIT_TOKEN:-}" ]; then
+              echo "ERROR: bamboo_GIT_TOKEN plan var unset" >&2; exit 1
+            fi
+            _host="${TEMPLATE_REPO#https://}"; _host="${_host#http://}"
+            git clone --depth 1 --branch "${TEMPLATE_REF}" \
+              -c "http.extraHeader=Authorization: Bearer ${bamboo_GIT_TOKEN}" \
+              "${TEMPLATE_REPO}" template
+            export TEMPLATE_ROOT="$(pwd)/template"
+            export PROJECT_ROOT="$(pwd)"
+
+            # Sink secrets via svc_* shim
+            export ARTIFACTORY_PASSWORD="${bamboo_svc_artifactory_password:-${bamboo_ARTIFACTORY_PASSWORD:-}}"
+            export DEPENDENCY_TRACK_API_KEY="${bamboo_svc_dependency_track_api_key:-${bamboo_DEPENDENCY_TRACK_API_KEY:-}}"
+            export SBOM_WEBHOOK_AUTH_HEADER="${bamboo_svc_sbom_webhook_auth_header:-${bamboo_SBOM_WEBHOOK_AUTH_HEADER:-}}"
+            export SPLUNK_HEC_TOKEN="${bamboo_svc_splunk_hec_token:-${bamboo_SPLUNK_HEC_TOKEN:-}}"
+
+            bash template/scripts/ingest/sbom-post.sh "${SBOM_FILE}" || true
+  requirements:
+    - system.docker.executable

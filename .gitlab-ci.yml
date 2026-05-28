@@ -200,7 +200,7 @@ syft-sbom-postscan:
   before_script:
     - *template-setup
   script:
-    - set -a; . ./build.env; set +a
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
     - bash template/scripts/scan/syft-sbom.sh
   artifacts:
     paths:
@@ -224,7 +224,7 @@ grype-vuln:
   before_script:
     - *template-setup
   script:
-    - set -a; . ./build.env; set +a
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
     - bash template/scripts/scan/grype-vuln.sh
   artifacts:
     paths:
@@ -244,7 +244,7 @@ trivy-sbom-postscan:
   before_script:
     - *template-setup
   script:
-    - set -a; . ./build.env; set +a
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
     - export SBOM_FILE="sbom-trivy.cdx.json"
     - export SBOM_INLINE_POST="true"
     - bash template/scripts/scan/trivy-sbom.sh
@@ -264,7 +264,7 @@ trivy-vuln-postscan:
   before_script:
     - *template-setup
   script:
-    - set -a; . ./build.env; set +a
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
     - export VULN_SCAN_FILE="vuln-scan-trivy.json"
     - export VULN_INLINE_POST="true"
     - bash template/scripts/scan/trivy-vuln.sh
@@ -289,7 +289,7 @@ sbom-ingest:
   before_script:
     - *template-setup
   script:
-    - set -a; . ./build.env; set +a
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
     - bash template/scripts/ingest/sbom-post.sh "${SBOM_FILE}"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
@@ -308,7 +308,7 @@ vuln-ingest:
   before_script:
     - *template-setup
   script:
-    - set -a; . ./build.env; set +a
+    - set -a; . ./build.env; set +a   # auto-export build.env vars to spawned subshells (build.env is dotenv-clean — no `export ` prefix, required by GitLab's reports.dotenv parser)
     - bash template/scripts/ingest/vuln-post.sh "${VULN_SCAN_FILE}"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
