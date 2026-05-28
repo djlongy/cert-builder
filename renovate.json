@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard"
+  ],
+  "dockerfile": {
+    "enabled": false,
+    "description": "DISABLED ON PURPOSE. The Dockerfile (and Dockerfile.example) carry ARG defaults like `ARG UPSTREAM_IMAGE=nginx` + `ARG CERT_BUILDER_IMAGE=docker.io/library/alpine:3.20` purely as fallbacks for direct `docker build .` invocations without the template's build.sh. In every real build, build.sh passes --build-arg from image.env, so those defaults are dead. Letting the dockerfile manager track them generates noise MRs ('bump nginx in Dockerfile.example') that nobody cares about. The customManager below tracks the ONE place that matters: the `# renovate:` hint in image.env."
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Bump UPSTREAM_TAG in image.env via the `# renovate:` hint",
+      "fileMatch": [
+        "(^|/)image\\.env(\\.example)?$"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?\\s*\\nUPSTREAM_TAG=\"?(?<currentValue>[^\"\\s]+)\"?"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Upstream base image bumps — auto-open MRs",
+      "matchManagers": ["custom.regex"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "labels": ["upstream-bump", "dependencies"],
+      "automerge": false
+    }
+  ],
+  "labels": ["dependencies"],
+  "commitMessagePrefix": "chore(deps):",
+  "prBodyTemplate": "{{{header}}}\n\n{{{table}}}\n\n{{{notes}}}\n\n{{{changelogs}}}\n\n{{{configDescription}}}\n\n{{{controls}}}\n\n{{{footer}}}"
+}
